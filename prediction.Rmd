@@ -1,0 +1,259 @@
+---
+title: "Prediction - Comparing Trees"
+author: "Amanda Oliveira"
+output: html_document
+---
+
+```{r, message=FALSE}
+
+# install.packages("tidyr")
+# install.packages("dplyr")
+# install.packages("tidyverse")
+# install.packages("psych")
+# install.packages("caret")
+# install.packages("rpart")
+# install.packages("MLmetrics")
+# install.packages("party")
+# install.packages("C50")
+#install.packages("e1071")
+
+
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(psych)
+library(caret)
+library(rpart)
+library(MLmetrics)
+library(party)
+library(C50)
+library(e1071)
+
+
+```
+
+## **1. Application: Predicting Student Dropouts** 
+
+Many universities have a problem with students over-enrolling in courses at the beginning of semester and then dropping most of them as the make decisions about which classes to attend. This makes it difficult to plan for the semester and allocate resources. However, schools don't want to restrict the choice of their students. One solution is to create predictions of which students are likely to drop out of which courses and use these predictions to inform semester planning. 
+
+In this project I will be modeling student data using three flavors of tree algorithm: CART, C4.5 and C5.0. I will be using these algorithms to attempt to predict which students drop out of courses
+
+The data comes from a university registrar's office. The code book for the variables are available in the file code-book.txt. 
+
+"Complete" is the variable I will attempt to predict. 
+
+#### **1.1. Data Wrangling ** 
+
+```{r}
+
+students <- read.csv("./data/drop-out.csv")
+
+# Data Wrangling 
+head(students)
+students$complete <- as.factor(students$complete)
+students$international <- as.factor(students$international)
+students$online <- as.factor(students$online)
+
+```
+
+#### **1.2. Training and Test Data **
+
+The next step is to separate the data set into a training set and a test set. I will randomly select 25% of the students to be the test data set and leave the remaining 75% for your training data set. (Note: each row represents an answer, not a single student.)
+
+
+```{r}
+
+# Generate data frame with unique IDs
+ids <- students %>% select(student_id) %>% unique()
+
+## set seed and determine proportion: 75%
+set.seed(123)
+train_ind <- sample(seq_len(nrow(ids)), size = floor(0.75 * nrow(ids)))
+
+## Get IDs by group
+train_ids <- as.data.frame(ids[train_ind, ])
+  names(train_ids)[1] <- "student_id"
+test_ids <- as.data.frame(ids[-train_ind, ])
+  names(test_ids)[1] <- "student_id"
+
+## Train and Test Dataframes
+train <- left_join(train_ids, students)
+test <- left_join(test_ids, students)
+
+
+```
+
+#### **1.3. Visualize the relationships between variables as a scatterplot matrix**
+
+```{r}
+
+# Binaries 
+# No correlation between completion and gender, #courses and international/online status (correlation not statistically different from zero).
+# Strong negative correlation between years and completion: the longer the student has been enrolled in the program, the likelier they are to drop courses out. These students (with >years) are also more likely to enroll in more courses. Looks like they learn to be more strategic with enrolling! (adding more courses to have more options!). I started doing it on my second semester at TC! 
+# Completion is negatively correlated with entrance test score - but the size of such correlation is pretty small. 
+# Other interesting correlations: international status is strongly and negatively correlated with online status (visa requirements requiring in-person enrollment?)
+
+pdf("scatterplot_matrix.pdf") 
+pairs.panels(students[,c(5,2,3,4,8,9,10)], 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE, # show density plots
+             bg=c("yellow","blue"),
+             pch=21, 
+             stars=TRUE, 
+             main="Correlation between couse completion and other indicators"
+             )
+dev.off()
+
+# Select Variables
+test <- test[,-c(6)]
+train <- train[,-c(6)]
+
+```
+
+## **2. Prediction Models**
+
+#### **2.1. CART Trees**
+
+I will use the [rpart package](https://cran.r-project.org/web/packages/rpart/rpart.pdf) to generate CART tree models.
+
+
+```{r}
+
+#caret does not summarize the metrics we want by default so we have to modify the output
+MySummary  <- function(data, lev = NULL, model = NULL){
+  df <- defaultSummary(data, lev, model)
+  tc <- twoClassSummary(data, lev, model)
+  pr <- prSummary(data, lev, model)
+  out <- c(df,tc,pr)
+  out}
+
+#Define the control elements we would like to use
+ctrl <- trainControl(method = "repeatedcv",         #Tell caret to perform k-fold cross validation
+                repeats = 3,                        #Tell caret to repeat each fold three times
+                classProbs = TRUE,                  #Calculate class probabilities
+                summaryFunction = MySummary)
+
+#Define the model
+cartFit <- train(complete ~ .,                      #Define which variable to predict 
+                data = train[,-c(1)],               #Define the data set to train the model on. Remove Student ID
+                trControl = ctrl,                   #Tell caret the control elements
+                method = "rpart",                   #Define the model type
+                metric = "Accuracy",                #Final model choice is made according to sensitivity
+                preProc = c("center", "scale"))     #Center and scale the data to minimize the 
+
+#Check the results
+cartFit
+plot(cartFit)
+
+
+#Note on F1 metric:
+## Use the sensitivity and specificity metrics to calculate the F1 metric
+## F1 is the harmonic mean of Sens and Spec - with equal shares
+## F1=(2Prec*Sens)/(Prec+Sens) = (2x.983x.645)/(.983+.645) = 1.26/1.628 = .774 (errors of rounding)
+
+
+
+# I will now predict results from the test data and describe important attributes of this test. 
+
+#Generate prediction using previously trained model
+p1 <- predict(cartFit, newdata = test[,-c(1)]) # Remove student ID from data
+
+#Generate model statistics
+confusionMatrix(data = p1, as.factor(test$complete), positive = "yes")
+
+# The model performed relatively well on test data. 
+# On a positive note there were very few false negatives. So the model correctly identified those students who would end up dropping out. This can be seen in the very high model sensitivity (> 99%). 
+# However, this was done at the expense of a lot of false positives (low specificity). This may generate over-enrollment in the course. 
+# Factoring in both the cost of FP and FN, a better metric is the model Balanced Accuracy = 83% 
+
+
+```
+
+#### **2.2 Conditional Inference Trees**
+
+Now I will train a Conditional Inference Tree using the `party` package on the same training data and examine the new results.
+
+```{r}
+
+#Define the model - Train C5.0 model
+condFit <- train(complete ~ .,                      #Define which variable to predict 
+                data = train[,-c(1)],               #Define the data set to train the model on. Remove Student ID
+                trControl = ctrl,                   #Tell caret the control elements
+                method = "ctree",                   #Define the model type
+                metric = "Accuracy",                #Final model choice is made according to sensitivity
+                preProc = c("center", "scale"))     #Center and scale the data to minimize the 
+
+#Check the results
+condFit
+summary(condFit)
+  
+# Test model accuracy on test data 
+p2 <- predict(condFit, test[,-c(1)])
+  
+# Compare prediction to actual test data to model data
+table(test[,5], p2)
+confusionMatrix(data = p2, as.factor(test$complete), positive = "yes")
+
+# Plot tree
+plot(condFit)
+
+## This model performed slightly better than the previous one. It managed to improve sensitivity (no False negatives at all) without adding extra False Positives to it. In fact, the Specificity also improved slightly. 
+
+```
+
+#### **2.3. C5.0**
+
+There is an updated version of the C4.5 model called C5.0, it is implemented in the C50 package. I will now train and then test the C5.0 model on the same data.
+
+```{r}
+
+
+#Define the model - Train C5.0 model
+c50Fit <- train(complete ~ .,                       #Define which variable to predict 
+                data = train[,-c(1)],               #Define the data set to train the model on. Remove Student ID
+                trControl = ctrl,                   #Tell caret the control elements
+                method = "C5.0",                    #Define the model type
+                metric = "Accuracy",                #Final model choice is made according to sensitivity
+                preProc = c("center", "scale"))     #Center and scale the data to minimize the 
+
+#Check the results
+c50Fit
+summary(c50Fit)
+  
+# Test model accuracy on test data 
+p3 <- predict(c50Fit, test[,-c(1)])
+  
+# Compare prediction to actual test data to model data
+table(test[,5], p3)
+confusionMatrix(data = p3, as.factor(test$complete), positive = "yes")
+
+# Plot tree
+plot(c50Fit)
+  
+  
+```
+
+## **3. Compare the Models**
+
+caret allows us to compare all three models at once.
+
+```{r}
+
+resamps <- resamples(list(cart_p1 = cartFit, condinf_p2 = condFit, cfiveo_p3 = c50Fit))
+
+summary(resamps)
+
+# Model 2 (using conditional inference trees) performed best in nearly all metrics.
+# For the purpose of choosing a model, I would recommend focusing on Sensitivity (the ability to predict when the student will dropout when we account of FN) and Specificity (the ability to predict when a student will complete the course accounting for the students being mislabeled as someone who will dropout) to choose the best model. 
+# Using Sensitivity as a measure is a good way to ensure a minimum attendance to your class - thus securing the class' return to investment. 
+# Specificity is also useful. Low Specificity may lead to over-crowded classes. Which may be very problematic as well. 
+# Using Sensitivity and Specificity as a criteria (and also F), the best model is P2 (Conditional Inference Trees)
+
+```
+
+Question to keep in mind:
+
+* Which variables (features) within your chosen model are important, do these features provide insights that may be useful in solving the problem of students dropping out of courses?
+
+
